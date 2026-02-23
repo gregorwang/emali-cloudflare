@@ -34,6 +34,7 @@ Repository now contains two workers:
 - Internal command endpoints (service-only):
   - `POST /internal/reprocess/:emailId`
   - `POST /internal/replay-action/:emailId`
+  - `POST /internal/send-reply/:emailId`
 - D1 migrations:
   - `migrations/0001_init.sql`
   - `migrations/0002_admin_observability.sql`
@@ -51,6 +52,7 @@ Repository now contains two workers:
   - `POST /admin/api/manual-reviews/:id/status`
   - `POST /admin/api/emails/:id/reprocess`
   - `POST /admin/api/emails/:id/replay-action`
+  - `POST /admin/api/emails/:id/send-reply`
 
 ## Setup
 
@@ -67,6 +69,7 @@ npm install
 ```bash
 wrangler secret put OPENAI_API_KEY
 wrangler secret put CF_AIG_TOKEN
+wrangler secret put RESEND_API_KEY
 wrangler secret put SLACK_WEBHOOK_URL
 wrangler secret put CUSTOM_WEBHOOK_URL
 wrangler secret put DASHBOARD_API_SECRET
@@ -74,6 +77,8 @@ wrangler secret put INTERNAL_API_SECRET
 ```
 
 `OPENAI_API_KEY` or `CF_AIG_TOKEN` is enough for AI calls. If both are missing, heuristic fallback is used.
+If `AI Gateway` is not configured yet, worker will fallback to direct OpenAI-compatible endpoint via `OPENAI_BASE_URL`.
+To send outbound replies, `RESEND_API_KEY` and `REPLY_FROM_EMAIL` must be configured.
 
 4. Apply D1 schema:
 
@@ -101,6 +106,10 @@ Optional vars in `wrangler.toml`:
 - `MAX_QUEUE_MESSAGE_BYTES` (default `122880`)
 - `RETENTION_DAYS_EMAILS` (default `365`)
 - `FALLBACK_AI_MODEL` (default `@cf/meta/llama-3.1-8b-instruct`)
+- `OPENAI_BASE_URL` (default `https://api.moonshot.cn/v1`)
+- `REPLY_FROM_EMAIL` (default `gregorwang@wangjiajun.asia`)
+- `AUTO_SEND_REPLY` (`true/false`, default `false`)
+- `AUTO_SEND_MIN_CONFIDENCE` (default `0.90`)
 
 ## Admin setup
 
@@ -129,3 +138,11 @@ Deploy:
 cd smartmail-admin
 npx wrangler deploy
 ```
+
+## Email routing reminder
+
+Inbound route still needs to be configured in Cloudflare Dashboard:
+
+- `Email` -> `Email Routing` -> `Routing rules`
+- Add rule for `gregorwang@wangjiajun.asia`
+- Action target: Worker `smartmail-ai`

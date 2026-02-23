@@ -85,6 +85,11 @@ export default {
       return await forwardInternalCommand(env, `/internal/replay-action/${emailId}`);
     }
 
+    if (request.method === "POST" && path.startsWith("/admin/api/emails/") && path.endsWith("/send-reply")) {
+      const emailId = path.slice("/admin/api/emails/".length, -"/send-reply".length);
+      return await forwardInternalCommand(env, `/internal/send-reply/${emailId}`);
+    }
+
     return json({ error: "Not found" }, 404);
   }
 };
@@ -291,7 +296,7 @@ async function getEmailDetail(
     db
       .prepare(
         `SELECT category, subcategory, sentiment, priority, language, summary, tags, requires_reply,
-                extracted_json, confidence_score, ai_provider, ai_model, processing_ms, created_at
+                extracted_json, confidence_score, ai_provider, ai_model, processing_ms, reply_draft, reply_draft_json, created_at
          FROM email_ai_results
          WHERE email_id = ?
          ORDER BY created_at DESC
@@ -687,6 +692,7 @@ function dashboardHtml(): string {
         '<button id="btn-reprocess">Reprocess</button>' +
         '<button id="btn-replay">Replay Action</button>' +
         '<button id="btn-raw">查看未脱敏 AI 输出</button>' +
+        '<button id="btn-send-reply">发送回复</button>' +
         '</div>' +
         '<h4>正文</h4><pre>' + esc(String(d.email.text_body || "")) + '</pre>' +
         '<h4>AI 结构化结果</h4><pre>' + esc(JSON.stringify(d.aiResult || {}, null, 2)) + '</pre>' +
@@ -708,6 +714,9 @@ function dashboardHtml(): string {
         const rawData = await rawRes.json();
         const box = document.getElementById("raw-box");
         box.textContent = JSON.stringify(rawData.detail ? rawData.detail.aiRaw : {}, null, 2);
+      });
+      document.getElementById("btn-send-reply").addEventListener("click", async () => {
+        await postAction("/admin/api/emails/" + id + "/send-reply");
       });
     }
 

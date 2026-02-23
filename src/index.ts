@@ -1,13 +1,15 @@
 import PostalMime from "postal-mime";
 import { z } from "zod";
-import { classifyEmail } from "./ai";
-import { executePostAIFlow } from "./actions";
+import { classifyEmail, generateReplyDraft } from "./ai";
+import { executePostAIFlow, maybeSendReplyDraft, sendReplyDraftNow } from "./actions";
 import { handleApiRequest } from "./api";
 import {
   deleteEmailCascade,
   getAIClassificationByEmailId,
   getQueueMessageById,
+  getReplyDraftByEmailId,
   insertAIRawResponse,
+  insertActionLog,
   insertAttachments,
   insertCleanupRun,
   insertEmailIfNotExists,
@@ -19,6 +21,7 @@ import {
   markEmailStatus,
   saveFailedQueueRecord,
   setEmailRetryStatus,
+  upsertReplyDraft,
   upsertAIResult
 } from "./db";
 import type { AttachmentMeta, Env, QueueMessage } from "./types";
@@ -224,7 +227,62 @@ async function processMessage(payload: QueueMessage, env: Env): Promise<void> {
       category: aiResult.classification.category,
       confidenceScore: aiResult.classification.confidenceScore
     });
+
+    let replyDraftGenerated = false;
+    if (aiResult.classification.requiresReply) {
+      try {
+        const replyResult = await generateReplyDraft(env, payload, aiResult.classification);
+        await upsertReplyDraft(env.DB, payload.messageId, replyResult.draft);
+        await insertAIRawResponse(
+          env.DB,
+          payload.messageId,
+          `${replyResult.provider}:reply-draft`,
+          replyResult.model,
+          replyResult.rawTrace
+        );
+        replyDraftGenerated = true;
+      } catch (err) {
+        await insertActionLog(
+          env.DB,
+          payload.messageId,
+          "reply_draft_generate",
+          { requiresReply: true },
+          "failed",
+          err instanceof Error ? err.message : "reply draft generation failed"
+        );
+      }
+    }
+
     const actionResult = await executePostAIFlow(env, payload, aiResult.classification);
+    let replySent = false;
+    if (replyDraftGenerated) {
+      const draft = await getReplyDraftByEmailId(env.DB, payload.messageId);
+      if (draft) {
+        try {
+          const sendResult = await maybeSendReplyDraft(env, payload, aiResult.classification, draft);
+          replySent = sendResult.sent;
+          if (!sendResult.sent && sendResult.reason) {
+            await insertActionLog(
+              env.DB,
+              payload.messageId,
+              "reply_send_skipped",
+              { reason: sendResult.reason },
+              "success"
+            );
+          }
+        } catch (err) {
+          await insertActionLog(
+            env.DB,
+            payload.messageId,
+            "reply_sent_resend",
+            { mode: "auto", to: payload.from },
+            "failed",
+            err instanceof Error ? err.message : "reply send failed"
+          );
+        }
+      }
+    }
+
     await markEmailStatus(
       env.DB,
       payload.messageId,
@@ -236,7 +294,9 @@ async function processMessage(payload: QueueMessage, env: Env): Promise<void> {
       actionResult.manualReviewCreated ? "manual_review" : "action_done",
       "ok",
       {
-        manualReviewCreated: actionResult.manualReviewCreated
+        manualReviewCreated: actionResult.manualReviewCreated,
+        replyDraftGenerated,
+        replySent
       }
     );
   } catch (err) {
@@ -430,6 +490,12 @@ async function handleInternalRequest(request: Request, env: Env): Promise<Respon
     return await runReplayAction(env, emailId);
   }
 
+  if (path.startsWith("/internal/send-reply/")) {
+    const emailId = path.slice("/internal/send-reply/".length);
+    if (!emailId) return json({ error: "missing email id" }, 400);
+    return await runSendReply(env, emailId);
+  }
+
   return json({ error: "Not found" }, 404);
 }
 
@@ -489,6 +555,42 @@ async function runReplayAction(env: Env, emailId: string): Promise<Response> {
   }
 }
 
+async function runSendReply(env: Env, emailId: string): Promise<Response> {
+  const payload = await getQueueMessageById(env.DB, emailId);
+  if (!payload) return json({ error: "email not found" }, 404);
+
+  const draft = await getReplyDraftByEmailId(env.DB, emailId);
+  if (!draft) return json({ error: "reply draft not found" }, 404);
+
+  try {
+    await sendReplyDraftNow(env, payload, draft);
+    await safeInsertEvent(env.DB, emailId, "action_done", "ok", {
+      source: "admin_send_reply",
+      to: payload.from
+    });
+    return json({ ok: true, emailId });
+  } catch (err) {
+    await insertActionLog(
+      env.DB,
+      emailId,
+      "reply_sent_resend",
+      { mode: "manual", to: payload.from },
+      "failed",
+      err instanceof Error ? err.message : "manual reply send failed"
+    );
+    await safeInsertEvent(env.DB, emailId, "action_done", "failed", {
+      source: "admin_send_reply",
+      error: err instanceof Error ? err.message : "manual reply send failed"
+    });
+    return json(
+      {
+        error: err instanceof Error ? err.message : "manual reply send failed"
+      },
+      500
+    );
+  }
+}
+
 async function processExistingMessage(
   payload: QueueMessage,
   env: Env,
@@ -524,7 +626,61 @@ async function processExistingMessage(
       confidenceScore: aiResult.classification.confidenceScore
     });
 
+    let replyDraftGenerated = false;
+    if (aiResult.classification.requiresReply) {
+      try {
+        const replyResult = await generateReplyDraft(env, payload, aiResult.classification);
+        await upsertReplyDraft(env.DB, payload.messageId, replyResult.draft);
+        await insertAIRawResponse(
+          env.DB,
+          payload.messageId,
+          `${replyResult.provider}:reply-draft`,
+          replyResult.model,
+          replyResult.rawTrace
+        );
+        replyDraftGenerated = true;
+      } catch (err) {
+        await insertActionLog(
+          env.DB,
+          payload.messageId,
+          "reply_draft_generate",
+          { requiresReply: true, source },
+          "failed",
+          err instanceof Error ? err.message : "reply draft generation failed"
+        );
+      }
+    }
+
     const actionResult = await executePostAIFlow(env, payload, aiResult.classification);
+    let replySent = false;
+    if (replyDraftGenerated) {
+      const draft = await getReplyDraftByEmailId(env.DB, payload.messageId);
+      if (draft) {
+        try {
+          const sendResult = await maybeSendReplyDraft(env, payload, aiResult.classification, draft);
+          replySent = sendResult.sent;
+          if (!sendResult.sent && sendResult.reason) {
+            await insertActionLog(
+              env.DB,
+              payload.messageId,
+              "reply_send_skipped",
+              { source, reason: sendResult.reason },
+              "success"
+            );
+          }
+        } catch (err) {
+          await insertActionLog(
+            env.DB,
+            payload.messageId,
+            "reply_sent_resend",
+            { mode: "auto", source, to: payload.from },
+            "failed",
+            err instanceof Error ? err.message : "reply send failed"
+          );
+        }
+      }
+    }
+
     await markEmailStatus(
       env.DB,
       payload.messageId,
@@ -537,7 +693,9 @@ async function processExistingMessage(
       "ok",
       {
         source,
-        manualReviewCreated: actionResult.manualReviewCreated
+        manualReviewCreated: actionResult.manualReviewCreated,
+        replyDraftGenerated,
+        replySent
       }
     );
   } catch (err) {

@@ -1,5 +1,5 @@
 import { createManualReviewTask, insertActionLog, markEmailStatus } from "./db";
-import type { AIClassification, ActionRuleConfig, Env, QueueMessage } from "./types";
+import type { AIClassification, AIReplyDraft, ActionRuleConfig, Env, QueueMessage } from "./types";
 
 const defaultRules: Required<ActionRuleConfig> = {
   spamAction: "drop",
@@ -20,6 +20,71 @@ export async function executePostAIFlow(
   await runNotifications(env, payload, classification, rules);
   const manualReviewCreated = await maybeCreateManualReview(env, payload, classification, rules);
   return { manualReviewCreated };
+}
+
+export async function maybeSendReplyDraft(
+  env: Env,
+  payload: QueueMessage,
+  classification: AIClassification,
+  draft: AIReplyDraft
+): Promise<{ sent: boolean; reason?: string }> {
+  if (!env.RESEND_API_KEY || !env.REPLY_FROM_EMAIL) {
+    return { sent: false, reason: "missing resend config" };
+  }
+
+  const autoEnabled = String(env.AUTO_SEND_REPLY ?? "false").toLowerCase() === "true";
+  if (!autoEnabled) {
+    return { sent: false, reason: "auto send disabled" };
+  }
+
+  const minConfidence = Number.parseFloat(env.AUTO_SEND_MIN_CONFIDENCE ?? "0.85");
+  if (!Number.isFinite(minConfidence)) {
+    return { sent: false, reason: "invalid AUTO_SEND_MIN_CONFIDENCE" };
+  }
+
+  if (!draft.autoSendSafe) {
+    return { sent: false, reason: "draft autoSendSafe=false" };
+  }
+  if (classification.confidenceScore < minConfidence) {
+    return { sent: false, reason: `confidence below threshold ${minConfidence}` };
+  }
+
+  await sendReplyViaResend(env, payload, draft);
+  await insertActionLog(
+    env.DB,
+    payload.messageId,
+    "reply_sent_resend",
+    {
+      mode: "auto",
+      to: payload.from,
+      from: env.REPLY_FROM_EMAIL,
+      autoSendSafe: draft.autoSendSafe
+    },
+    "success"
+  );
+  return { sent: true };
+}
+
+export async function sendReplyDraftNow(
+  env: Env,
+  payload: QueueMessage,
+  draft: AIReplyDraft
+): Promise<void> {
+  if (!env.RESEND_API_KEY || !env.REPLY_FROM_EMAIL) {
+    throw new Error("RESEND_API_KEY or REPLY_FROM_EMAIL is not configured");
+  }
+  await sendReplyViaResend(env, payload, draft);
+  await insertActionLog(
+    env.DB,
+    payload.messageId,
+    "reply_sent_resend",
+    {
+      mode: "manual",
+      to: payload.from,
+      from: env.REPLY_FROM_EMAIL
+    },
+    "success"
+  );
 }
 
 async function loadRules(config: KVNamespace, toAddress: string): Promise<Required<ActionRuleConfig>> {
@@ -152,4 +217,31 @@ async function maybeCreateManualReview(
   await insertActionLog(env.DB, payload.messageId, "manual_review_created", { reason, priority }, "success");
   await markEmailStatus(env.DB, payload.messageId, "manual_review");
   return true;
+}
+
+async function sendReplyViaResend(
+  env: Env,
+  payload: QueueMessage,
+  draft: AIReplyDraft
+): Promise<void> {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      from: env.REPLY_FROM_EMAIL,
+      to: [payload.from],
+      subject: draft.subject,
+      text: draft.body,
+      reply_to: payload.to
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`resend send failed: HTTP ${res.status} ${body}`);
+  }
 }

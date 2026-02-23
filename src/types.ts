@@ -6,12 +6,17 @@ export interface Env {
   AI: Ai;
   CF_ACCOUNT_ID: string;
   AI_GATEWAY_ID: string;
+  OPENAI_BASE_URL?: string;
   OPENAI_API_KEY?: string;
   CF_AIG_TOKEN?: string;
   SLACK_WEBHOOK_URL?: string;
   CUSTOM_WEBHOOK_URL?: string;
+  RESEND_API_KEY?: string;
+  REPLY_FROM_EMAIL?: string;
   DASHBOARD_API_SECRET?: string;
   INTERNAL_API_SECRET?: string;
+  AUTO_SEND_REPLY?: string;
+  AUTO_SEND_MIN_CONFIDENCE?: string;
   MAX_TEXT_BODY_LENGTH?: string;
   MAX_QUEUE_MESSAGE_BYTES?: string;
   RETENTION_DAYS_EMAILS?: string;
@@ -77,6 +82,22 @@ export interface AIClassification {
 
 export interface AIClassifyResult {
   classification: AIClassification;
+  provider: string;
+  model: string;
+  rawTrace?: AIRawTrace;
+}
+
+export interface AIReplyDraft {
+  subject: string;
+  body: string;
+  tone: "formal" | "casual" | "empathetic";
+  language: string;
+  placeholders: string[];
+  autoSendSafe: boolean;
+}
+
+export interface AIReplyDraftResult {
+  draft: AIReplyDraft;
   provider: string;
   model: string;
   rawTrace?: AIRawTrace;

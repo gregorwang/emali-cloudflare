@@ -1,4 +1,4 @@
-import type { AIClassification, AIRawTrace, QueueMessage } from "./types";
+import type { AIClassification, AIRawTrace, AIReplyDraft, QueueMessage } from "./types";
 
 export async function insertEmailIfNotExists(db: D1Database, message: QueueMessage): Promise<boolean> {
   const result = await db
@@ -120,6 +120,56 @@ export async function insertAIRawResponse(
       rawTrace.responseJson ?? null
     )
     .run();
+}
+
+export async function upsertReplyDraft(
+  db: D1Database,
+  emailId: string,
+  draft: AIReplyDraft
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE email_ai_results
+       SET reply_draft = ?, reply_draft_json = ?
+       WHERE email_id = ?`
+    )
+    .bind(draft.body, JSON.stringify(draft), emailId)
+    .run();
+}
+
+export async function getReplyDraftByEmailId(
+  db: D1Database,
+  emailId: string
+): Promise<AIReplyDraft | null> {
+  const row = await db
+    .prepare(
+      `SELECT reply_draft_json, reply_draft
+       FROM email_ai_results
+       WHERE email_id = ?
+       LIMIT 1`
+    )
+    .bind(emailId)
+    .first<{ reply_draft_json: string | null; reply_draft: string | null }>();
+  if (!row) return null;
+
+  if (row.reply_draft_json) {
+    try {
+      const parsed = JSON.parse(row.reply_draft_json) as AIReplyDraft;
+      if (parsed?.subject && parsed?.body) return parsed;
+    } catch {
+      // ignore malformed JSON and use plain fallback below
+    }
+  }
+  if (!row.reply_draft) return null;
+
+  return {
+    subject: "Re: Your message",
+    body: row.reply_draft,
+    tone: "formal",
+    language: "en",
+    placeholders: [],
+    autoSendSafe: false
+  };
 }
 
 export async function insertProcessingEvent(
@@ -789,6 +839,8 @@ export async function getAdminEmailDetail(
     ai_provider: string | null;
     ai_model: string | null;
     processing_ms: number | null;
+    reply_draft: string | null;
+    reply_draft_json: string | null;
     created_at: string | null;
   } | null;
   aiRaw: {
@@ -848,7 +900,7 @@ export async function getAdminEmailDetail(
     db
       .prepare(
         `SELECT category, subcategory, sentiment, priority, language, summary, tags, requires_reply,
-                extracted_json, confidence_score, ai_provider, ai_model, processing_ms, created_at
+                extracted_json, confidence_score, ai_provider, ai_model, processing_ms, reply_draft, reply_draft_json, created_at
          FROM email_ai_results
          WHERE email_id = ?
          ORDER BY created_at DESC
@@ -869,6 +921,8 @@ export async function getAdminEmailDetail(
         ai_provider: string | null;
         ai_model: string | null;
         processing_ms: number | null;
+        reply_draft: string | null;
+        reply_draft_json: string | null;
         created_at: string | null;
       }>(),
     db

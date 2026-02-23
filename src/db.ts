@@ -1,0 +1,516 @@
+import type { AIClassification, QueueMessage } from "./types";
+
+export async function insertEmailIfNotExists(db: D1Database, message: QueueMessage): Promise<boolean> {
+  const result = await db
+    .prepare(
+      `INSERT INTO emails (
+          id, email_message_id, thread_id, received_at, to_address, from_address, from_name, subject, text_body,
+          has_attachments, raw_r2_key, parsed_r2_key, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(email_message_id) DO NOTHING`
+    )
+    .bind(
+      message.messageId,
+      message.emailId,
+      message.threadId ?? null,
+      message.receivedAt,
+      message.to,
+      message.from,
+      message.fromName || null,
+      message.subject,
+      message.textBody,
+      message.attachments.length > 0 ? 1 : 0,
+      message.rawR2Key,
+      message.parsedR2Key ?? null,
+      "processing"
+    )
+    .run();
+
+  return (result.meta?.changes ?? 0) > 0;
+}
+
+export async function insertAttachments(
+  db: D1Database,
+  emailId: string,
+  attachments: QueueMessage["attachments"]
+): Promise<void> {
+  if (attachments.length === 0) return;
+
+  const stmts = attachments.map((item) =>
+    db
+      .prepare(
+        `INSERT INTO attachments (id, email_id, filename, mime_type, size_bytes, r2_key)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(crypto.randomUUID(), emailId, item.filename, item.mimeType, item.size, item.r2Key ?? null)
+  );
+  await db.batch(stmts);
+}
+
+export async function upsertAIResult(
+  db: D1Database,
+  emailId: string,
+  classification: AIClassification,
+  provider: string,
+  model: string,
+  processingMs: number
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO email_ai_results (
+          id, email_id, category, subcategory, sentiment, priority, language, summary, tags, requires_reply,
+          extracted_json, confidence_score, ai_provider, ai_model, processing_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(email_id) DO UPDATE SET
+          category=excluded.category,
+          subcategory=excluded.subcategory,
+          sentiment=excluded.sentiment,
+          priority=excluded.priority,
+          language=excluded.language,
+          summary=excluded.summary,
+          tags=excluded.tags,
+          requires_reply=excluded.requires_reply,
+          extracted_json=excluded.extracted_json,
+          confidence_score=excluded.confidence_score,
+          ai_provider=excluded.ai_provider,
+          ai_model=excluded.ai_model,
+          processing_ms=excluded.processing_ms`
+    )
+    .bind(
+      crypto.randomUUID(),
+      emailId,
+      classification.category,
+      classification.subcategory ?? null,
+      classification.sentiment,
+      classification.priority,
+      classification.language,
+      classification.summary,
+      JSON.stringify(classification.tags),
+      classification.requiresReply ? 1 : 0,
+      JSON.stringify(classification.extractedEntities),
+      classification.confidenceScore,
+      provider,
+      model,
+      processingMs
+    )
+    .run();
+}
+
+export async function markEmailStatus(
+  db: D1Database,
+  emailId: string,
+  status: "pending" | "processing" | "done" | "error" | "failed_queue" | "manual_review",
+  errorMsg?: string
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE emails
+       SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    )
+    .bind(status, errorMsg?.slice(0, 2000) ?? null, emailId)
+    .run();
+
+  if (errorMsg && status === "error") {
+    await db
+      .prepare(
+        `INSERT INTO action_logs (id, email_id, action_type, action_config, status, error_msg)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(crypto.randomUUID(), emailId, "ai_process", "{}", "failed", errorMsg.slice(0, 2000))
+      .run();
+  }
+}
+
+export async function saveFailedQueueRecord(
+  db: D1Database,
+  message: QueueMessage,
+  reason: string
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO emails (
+          id, email_message_id, thread_id, received_at, to_address, from_address, from_name, subject, text_body,
+          has_attachments, raw_r2_key, parsed_r2_key, status, last_error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(email_message_id) DO UPDATE SET
+          status='failed_queue',
+          last_error=excluded.last_error,
+          updated_at=CURRENT_TIMESTAMP`
+    )
+    .bind(
+      message.messageId,
+      message.emailId,
+      message.threadId ?? null,
+      message.receivedAt,
+      message.to,
+      message.from,
+      message.fromName || null,
+      message.subject,
+      message.textBody,
+      message.attachments.length > 0 ? 1 : 0,
+      message.rawR2Key,
+      message.parsedR2Key ?? null,
+      "failed_queue",
+      reason.slice(0, 2000)
+    )
+    .run();
+}
+
+export async function listFailedQueueEmails(
+  db: D1Database,
+  limit = 50
+): Promise<Array<{ id: string; raw_r2_key: string | null; parsed_r2_key: string | null }>> {
+  const rows = await db
+    .prepare(
+      `SELECT id, raw_r2_key, parsed_r2_key
+       FROM emails
+       WHERE status = 'failed_queue'
+       ORDER BY updated_at ASC
+       LIMIT ?`
+    )
+    .bind(limit)
+    .all<{ id: string; raw_r2_key: string | null; parsed_r2_key: string | null }>();
+  return rows.results ?? [];
+}
+
+export async function setEmailRetryStatus(
+  db: D1Database,
+  emailId: string,
+  status: "processing" | "failed_queue",
+  errorMsg?: string
+): Promise<void> {
+  await markEmailStatus(db, emailId, status, errorMsg);
+}
+
+export async function getQueueMessageById(db: D1Database, id: string): Promise<QueueMessage | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, email_message_id, received_at, to_address, from_address, from_name, subject, text_body,
+              raw_r2_key, parsed_r2_key, thread_id
+       FROM emails
+       WHERE id = ?`
+    )
+    .bind(id)
+    .first<{
+      id: string;
+      email_message_id: string;
+      received_at: string;
+      to_address: string;
+      from_address: string;
+      from_name: string | null;
+      subject: string;
+      text_body: string | null;
+      raw_r2_key: string | null;
+      parsed_r2_key: string | null;
+      thread_id: string | null;
+    }>();
+  if (!row) return null;
+
+  const attachmentRows = await db
+    .prepare(
+      `SELECT filename, mime_type, size_bytes, r2_key
+       FROM attachments
+       WHERE email_id = ?`
+    )
+    .bind(id)
+    .all<{ filename: string; mime_type: string | null; size_bytes: number | null; r2_key: string | null }>();
+
+  return {
+    messageId: row.id,
+    emailId: row.email_message_id,
+    receivedAt: row.received_at,
+    to: row.to_address,
+    from: row.from_address,
+    fromName: row.from_name ?? "",
+    subject: row.subject,
+    textBody: row.text_body ?? "",
+    hasHtml: false,
+    attachments: (attachmentRows.results ?? []).map((a) => ({
+      filename: a.filename,
+      mimeType: a.mime_type ?? "application/octet-stream",
+      size: a.size_bytes ?? 0,
+      r2Key: a.r2_key ?? undefined
+    })),
+    rawR2Key: row.raw_r2_key ?? "",
+    parsedR2Key: row.parsed_r2_key ?? undefined,
+    threadId: row.thread_id ?? undefined,
+    priority: "normal"
+  };
+}
+
+export async function insertActionLog(
+  db: D1Database,
+  emailId: string,
+  actionType: string,
+  actionConfig: unknown,
+  status: "success" | "failed",
+  errorMsg?: string
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO action_logs (id, email_id, action_type, action_config, status, error_msg)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      emailId,
+      actionType,
+      JSON.stringify(actionConfig ?? {}),
+      status,
+      errorMsg?.slice(0, 2000) ?? null
+    )
+    .run();
+}
+
+export async function createManualReviewTask(
+  db: D1Database,
+  emailId: string,
+  priority: "P0" | "P1" | "P2",
+  reason: string
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO manual_review_tasks (
+        id, email_id, priority_level, reason, status
+      ) VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(crypto.randomUUID(), emailId, priority, reason.slice(0, 2000), "pending")
+    .run();
+}
+
+export async function listExpiredEmailObjects(
+  db: D1Database,
+  cutoffIso: string,
+  limit = 200
+): Promise<Array<{ id: string; raw_r2_key: string | null }>> {
+  const rows = await db
+    .prepare(
+      `SELECT id, raw_r2_key
+       FROM emails
+       WHERE legal_hold = 0
+         AND received_at < ?
+       ORDER BY received_at ASC
+       LIMIT ?`
+    )
+    .bind(cutoffIso, limit)
+    .all<{ id: string; raw_r2_key: string | null }>();
+  return rows.results ?? [];
+}
+
+export async function listAttachmentKeysByEmailIds(
+  db: D1Database,
+  emailIds: string[]
+): Promise<string[]> {
+  if (emailIds.length === 0) return [];
+  const placeholders = emailIds.map(() => "?").join(",");
+  const rows = await db
+    .prepare(
+      `SELECT r2_key
+       FROM attachments
+       WHERE email_id IN (${placeholders})
+         AND r2_key IS NOT NULL`
+    )
+    .bind(...emailIds)
+    .all<{ r2_key: string }>();
+  return (rows.results ?? []).map((r) => r.r2_key);
+}
+
+export async function deleteEmailCascade(db: D1Database, emailIds: string[]): Promise<void> {
+  if (emailIds.length === 0) return;
+  const placeholders = emailIds.map(() => "?").join(",");
+  await db.batch([
+    db.prepare(`DELETE FROM manual_review_tasks WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM action_logs WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM email_ai_results WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM attachments WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM emails WHERE id IN (${placeholders})`).bind(...emailIds)
+  ]);
+}
+
+export async function insertCleanupRun(
+  db: D1Database,
+  deletedCount: number,
+  failedCount: number,
+  errorMsg?: string
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO cleanup_runs (id, started_at, finished_at, deleted_count, failed_count, error_msg)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      new Date().toISOString(),
+      new Date().toISOString(),
+      deletedCount,
+      failedCount,
+      errorMsg?.slice(0, 2000) ?? null
+    )
+    .run();
+}
+
+export async function listManualReviewTasks(
+  db: D1Database,
+  status?: "pending" | "acknowledged" | "processing" | "resolved" | "closed",
+  limit = 100
+): Promise<
+  Array<{
+    id: string;
+    email_id: string;
+    priority_level: string;
+    reason: string;
+    status: string;
+    assignee: string | null;
+    created_at: string;
+  }>
+> {
+  if (status) {
+    const rows = await db
+      .prepare(
+        `SELECT id, email_id, priority_level, reason, status, assignee, created_at
+         FROM manual_review_tasks
+         WHERE status = ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .bind(status, limit)
+      .all<{
+        id: string;
+        email_id: string;
+        priority_level: string;
+        reason: string;
+        status: string;
+        assignee: string | null;
+        created_at: string;
+      }>();
+    return rows.results ?? [];
+  }
+
+  const rows = await db
+    .prepare(
+      `SELECT id, email_id, priority_level, reason, status, assignee, created_at
+       FROM manual_review_tasks
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .bind(limit)
+    .all<{
+      id: string;
+      email_id: string;
+      priority_level: string;
+      reason: string;
+      status: string;
+      assignee: string | null;
+      created_at: string;
+    }>();
+  return rows.results ?? [];
+}
+
+export async function updateManualReviewTaskStatus(
+  db: D1Database,
+  id: string,
+  status: "acknowledged" | "processing" | "resolved" | "closed",
+  assignee?: string
+): Promise<void> {
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      `UPDATE manual_review_tasks
+       SET status = ?,
+           assignee = COALESCE(?, assignee),
+           acknowledged_at = CASE WHEN ? = 'acknowledged' THEN ? ELSE acknowledged_at END,
+           resolved_at = CASE WHEN ? IN ('resolved', 'closed') THEN ? ELSE resolved_at END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    )
+    .bind(status, assignee ?? null, status, now, status, now, id)
+    .run();
+}
+
+export async function listOverdueManualReviews(
+  db: D1Database
+): Promise<Array<{ id: string; email_id: string; priority_level: string; status: string; created_at: string }>> {
+  const rows = await db
+    .prepare(
+      `SELECT id, email_id, priority_level, status, created_at
+       FROM manual_review_tasks
+       WHERE status IN ('pending', 'acknowledged', 'processing')
+       ORDER BY created_at ASC`
+    )
+    .all<{ id: string; email_id: string; priority_level: string; status: string; created_at: string }>();
+  return rows.results ?? [];
+}
+
+export async function createPromptTemplate(
+  db: D1Database,
+  name: string,
+  version: string,
+  content: string,
+  outputSchema?: string,
+  createdBy?: string
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO prompt_templates (id, name, version, content, output_schema, created_by, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      name,
+      version,
+      content,
+      outputSchema ?? null,
+      createdBy ?? null,
+      0
+    )
+    .run();
+}
+
+export async function activatePromptTemplate(
+  db: D1Database,
+  name: string,
+  version: string
+): Promise<void> {
+  await db.batch([
+    db.prepare(`UPDATE prompt_templates SET is_active = 0 WHERE name = ?`).bind(name),
+    db
+      .prepare(`UPDATE prompt_templates SET is_active = 1 WHERE name = ? AND version = ?`)
+      .bind(name, version)
+  ]);
+}
+
+export async function listPromptTemplates(
+  db: D1Database,
+  name?: string
+): Promise<
+  Array<{
+    id: string;
+    name: string;
+    version: string;
+    is_active: number;
+    created_at: string;
+  }>
+> {
+  if (name) {
+    const rows = await db
+      .prepare(
+        `SELECT id, name, version, is_active, created_at
+         FROM prompt_templates
+         WHERE name = ?
+         ORDER BY created_at DESC`
+      )
+      .bind(name)
+      .all<{ id: string; name: string; version: string; is_active: number; created_at: string }>();
+    return rows.results ?? [];
+  }
+
+  const rows = await db
+    .prepare(
+      `SELECT id, name, version, is_active, created_at
+       FROM prompt_templates
+       ORDER BY created_at DESC`
+    )
+    .all<{ id: string; name: string; version: string; is_active: number; created_at: string }>();
+  return rows.results ?? [];
+}

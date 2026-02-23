@@ -1,0 +1,45 @@
+name = "smartmail-ai"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+[[queues.producers]]
+queue = "smartmail-email-queue"
+binding = "EMAIL_QUEUE"
+
+[[queues.consumers]]
+queue = "smartmail-email-queue"
+max_batch_size = 5
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "smartmail-dlq"
+
+[[queues.consumers]]
+queue = "smartmail-dlq"
+max_batch_size = 1
+
+[[d1_databases]]
+binding = "DB"
+database_name = "smartmail-db"
+database_id = "4c0c4835-c047-442c-84f7-e21275272075"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "smartmail-storage"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "e73c993ed4cc4c0ea1a5103be24beb61"
+
+[ai]
+binding = "AI"
+
+[vars]
+CF_ACCOUNT_ID = "fb9830705da200eab2799ed0d487c197"
+AI_GATEWAY_ID = "smartmail-gateway"
+ENVIRONMENT = "production"
+MAX_TEXT_BODY_LENGTH = "10000"
+MAX_QUEUE_MESSAGE_BYTES = "122880"
+RETENTION_DAYS_EMAILS = "365"
+DEFAULT_AI_MODEL = "openai/gpt-5-mini"
+FALLBACK_AI_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+DEFAULT_AI_PROVIDER = "ai-gateway"

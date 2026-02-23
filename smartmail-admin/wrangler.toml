@@ -1,0 +1,19 @@
+name = "smartmail-admin"
+main = "src/index.ts"
+compatibility_date = "2025-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "smartmail-db"
+database_id = "4c0c4835-c047-442c-84f7-e21275272075"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "e73c993ed4cc4c0ea1a5103be24beb61"
+
+[[services]]
+binding = "SMARTMAIL_AI"
+service = "smartmail-ai"
+
+[vars]
+REQUIRE_CF_ACCESS = "false"

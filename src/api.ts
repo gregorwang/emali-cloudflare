@@ -1,6 +1,7 @@
 import {
   activatePromptTemplate,
   createPromptTemplate,
+  insertProcessingEvent,
   listManualReviewTasks,
   listPromptTemplates,
   updateManualReviewTaskStatus
@@ -39,6 +40,22 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       assignee?: string;
     };
     await updateManualReviewTaskStatus(env.DB, id, body.status, body.assignee);
+    try {
+      const task = await env.DB
+        .prepare(`SELECT email_id FROM manual_review_tasks WHERE id = ?`)
+        .bind(id)
+        .first<{ email_id: string }>();
+      if (task?.email_id) {
+        await insertProcessingEvent(env.DB, task.email_id, "manual_review", "ok", {
+          source: "dashboard_api",
+          taskId: id,
+          status: body.status,
+          assignee: body.assignee ?? null
+        });
+      }
+    } catch (err) {
+      console.error("insertProcessingEvent(manual_review) failed", err);
+    }
     return json({ ok: true });
   }
 
@@ -77,10 +94,11 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 }
 
 function isAuthorized(request: Request, env: Env): boolean {
-  const secret = env.DASHBOARD_API_SECRET;
+  const secret = env.DASHBOARD_API_SECRET?.trim();
   if (!secret) return true;
   const auth = request.headers.get("authorization");
-  return auth === `Bearer ${secret}`;
+  const token = auth?.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  return token === secret;
 }
 
 function json(payload: unknown, status = 200): Response {
@@ -89,4 +107,3 @@ function json(payload: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json" }
   });
 }
-

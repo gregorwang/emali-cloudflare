@@ -5,10 +5,13 @@ import { executePostAIFlow } from "./actions";
 import { handleApiRequest } from "./api";
 import {
   deleteEmailCascade,
+  getAIClassificationByEmailId,
   getQueueMessageById,
+  insertAIRawResponse,
   insertAttachments,
   insertCleanupRun,
   insertEmailIfNotExists,
+  insertProcessingEvent,
   listAttachmentKeysByEmailIds,
   listExpiredEmailObjects,
   listFailedQueueEmails,
@@ -59,6 +62,10 @@ const queueMessageSchema = z.object({
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith("/internal/")) {
+      return await handleInternalRequest(request, env);
+    }
     return await handleApiRequest(request, env);
   },
 
@@ -115,6 +122,12 @@ export default {
       priority: inferPriority(parsed.subject ?? "", message.from)
     };
 
+    await safeInsertEvent(env.DB, payload.messageId, "received", "ok", {
+      to: payload.to,
+      from: payload.from,
+      subject: payload.subject
+    });
+
     const maxQueueBytes = parsePositiveInt(env.MAX_QUEUE_MESSAGE_BYTES, 120 * 1024);
     payload = applyQueuePayloadBudget(payload, maxQueueBytes);
 
@@ -125,12 +138,19 @@ export default {
 
     try {
       await env.EMAIL_QUEUE.send(payload);
+      await safeInsertEvent(env.DB, payload.messageId, "queued", "ok", {
+        priority: payload.priority
+      });
     } catch (err) {
       await saveFailedQueueRecord(
         env.DB,
         payload,
         err instanceof Error ? err.message : "queue send failed"
       );
+      await safeInsertEvent(env.DB, payload.messageId, "error", "failed", {
+        stage: "queue_send",
+        error: err instanceof Error ? err.message : "queue send failed"
+      });
       throw err;
     }
   },
@@ -167,10 +187,16 @@ export default {
 async function processMessage(payload: QueueMessage, env: Env): Promise<void> {
   const inserted = await insertEmailIfNotExists(env.DB, payload);
   if (!inserted) {
+    await safeInsertEvent(env.DB, payload.messageId, "processing", "ok", {
+      skipped: "duplicate"
+    });
     return;
   }
 
   try {
+    await safeInsertEvent(env.DB, payload.messageId, "processing", "ok", {
+      source: "queue"
+    });
     await insertAttachments(env.DB, payload.messageId, payload.attachments);
     const start = Date.now();
     const aiResult = await classifyEmail(env, payload);
@@ -184,11 +210,34 @@ async function processMessage(payload: QueueMessage, env: Env): Promise<void> {
       aiResult.model,
       elapsed
     );
+    await insertAIRawResponse(
+      env.DB,
+      payload.messageId,
+      aiResult.provider,
+      aiResult.model,
+      aiResult.rawTrace
+    );
+    await safeInsertEvent(env.DB, payload.messageId, "ai_done", "ok", {
+      provider: aiResult.provider,
+      model: aiResult.model,
+      elapsedMs: elapsed,
+      category: aiResult.classification.category,
+      confidenceScore: aiResult.classification.confidenceScore
+    });
     const actionResult = await executePostAIFlow(env, payload, aiResult.classification);
     await markEmailStatus(
       env.DB,
       payload.messageId,
       actionResult.manualReviewCreated ? "manual_review" : "done"
+    );
+    await safeInsertEvent(
+      env.DB,
+      payload.messageId,
+      actionResult.manualReviewCreated ? "manual_review" : "action_done",
+      "ok",
+      {
+        manualReviewCreated: actionResult.manualReviewCreated
+      }
     );
   } catch (err) {
     await markEmailStatus(
@@ -197,6 +246,10 @@ async function processMessage(payload: QueueMessage, env: Env): Promise<void> {
       "error",
       err instanceof Error ? err.message : "unknown process error"
     );
+    await safeInsertEvent(env.DB, payload.messageId, "error", "failed", {
+      stage: "process",
+      error: err instanceof Error ? err.message : "unknown process error"
+    });
     throw err;
   }
 }
@@ -269,6 +322,9 @@ async function retryFailedQueueMessages(env: Env): Promise<void> {
       }
       await env.EMAIL_QUEUE.send(payload);
       await setEmailRetryStatus(env.DB, row.id, "processing");
+      await safeInsertEvent(env.DB, row.id, "retry", "ok", {
+        source: "scheduled_retry"
+      });
     } catch (err) {
       await setEmailRetryStatus(
         env.DB,
@@ -276,6 +332,10 @@ async function retryFailedQueueMessages(env: Env): Promise<void> {
         "failed_queue",
         err instanceof Error ? err.message : "retry failed"
       );
+      await safeInsertEvent(env.DB, row.id, "retry", "failed", {
+        source: "scheduled_retry",
+        error: err instanceof Error ? err.message : "retry failed"
+      });
     }
   }
 }
@@ -346,4 +406,188 @@ function isManualReviewOverdue(priority: string, elapsedMinutes: number): boolea
   if (priority === "P0") return elapsedMinutes > 15;
   if (priority === "P1") return elapsedMinutes > 30;
   return elapsedMinutes > 240;
+}
+
+async function handleInternalRequest(request: Request, env: Env): Promise<Response> {
+  if (!isInternalAuthorized(request, env)) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  if (request.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
+  }
+
+  const path = new URL(request.url).pathname;
+  if (path.startsWith("/internal/reprocess/")) {
+    const emailId = path.slice("/internal/reprocess/".length);
+    if (!emailId) return json({ error: "missing email id" }, 400);
+    return await runReprocess(env, emailId);
+  }
+
+  if (path.startsWith("/internal/replay-action/")) {
+    const emailId = path.slice("/internal/replay-action/".length);
+    if (!emailId) return json({ error: "missing email id" }, 400);
+    return await runReplayAction(env, emailId);
+  }
+
+  return json({ error: "Not found" }, 404);
+}
+
+async function runReprocess(env: Env, emailId: string): Promise<Response> {
+  const payload = await getQueueMessageById(env.DB, emailId);
+  if (!payload) return json({ error: "email not found" }, 404);
+
+  try {
+    await markEmailStatus(env.DB, emailId, "processing");
+    await safeInsertEvent(env.DB, emailId, "retry", "ok", {
+      source: "admin_reprocess"
+    });
+    await processExistingMessage(payload, env, "admin_reprocess");
+    return json({ ok: true, emailId });
+  } catch (err) {
+    return json(
+      {
+        error: err instanceof Error ? err.message : "reprocess failed"
+      },
+      500
+    );
+  }
+}
+
+async function runReplayAction(env: Env, emailId: string): Promise<Response> {
+  const payload = await getQueueMessageById(env.DB, emailId);
+  if (!payload) return json({ error: "email not found" }, 404);
+
+  const classification = await getAIClassificationByEmailId(env.DB, emailId);
+  if (!classification) return json({ error: "ai result not found" }, 404);
+
+  try {
+    const actionResult = await executePostAIFlow(env, payload, classification);
+    await markEmailStatus(env.DB, emailId, actionResult.manualReviewCreated ? "manual_review" : "done");
+    await safeInsertEvent(
+      env.DB,
+      emailId,
+      actionResult.manualReviewCreated ? "manual_review" : "action_done",
+      "ok",
+      {
+        source: "admin_replay_action",
+        manualReviewCreated: actionResult.manualReviewCreated
+      }
+    );
+    return json({ ok: true, emailId });
+  } catch (err) {
+    await safeInsertEvent(env.DB, emailId, "action_done", "failed", {
+      source: "admin_replay_action",
+      error: err instanceof Error ? err.message : "replay action failed"
+    });
+    return json(
+      {
+        error: err instanceof Error ? err.message : "replay action failed"
+      },
+      500
+    );
+  }
+}
+
+async function processExistingMessage(
+  payload: QueueMessage,
+  env: Env,
+  source: string
+): Promise<void> {
+  try {
+    await safeInsertEvent(env.DB, payload.messageId, "processing", "ok", { source });
+    const start = Date.now();
+    const aiResult = await classifyEmail(env, payload);
+    const elapsed = Date.now() - start;
+
+    await upsertAIResult(
+      env.DB,
+      payload.messageId,
+      aiResult.classification,
+      aiResult.provider,
+      aiResult.model,
+      elapsed
+    );
+    await insertAIRawResponse(
+      env.DB,
+      payload.messageId,
+      aiResult.provider,
+      aiResult.model,
+      aiResult.rawTrace
+    );
+    await safeInsertEvent(env.DB, payload.messageId, "ai_done", "ok", {
+      source,
+      provider: aiResult.provider,
+      model: aiResult.model,
+      elapsedMs: elapsed,
+      category: aiResult.classification.category,
+      confidenceScore: aiResult.classification.confidenceScore
+    });
+
+    const actionResult = await executePostAIFlow(env, payload, aiResult.classification);
+    await markEmailStatus(
+      env.DB,
+      payload.messageId,
+      actionResult.manualReviewCreated ? "manual_review" : "done"
+    );
+    await safeInsertEvent(
+      env.DB,
+      payload.messageId,
+      actionResult.manualReviewCreated ? "manual_review" : "action_done",
+      "ok",
+      {
+        source,
+        manualReviewCreated: actionResult.manualReviewCreated
+      }
+    );
+  } catch (err) {
+    await markEmailStatus(
+      env.DB,
+      payload.messageId,
+      "error",
+      err instanceof Error ? err.message : "reprocess failed"
+    );
+    await safeInsertEvent(env.DB, payload.messageId, "error", "failed", {
+      source,
+      error: err instanceof Error ? err.message : "reprocess failed"
+    });
+    throw err;
+  }
+}
+
+function isInternalAuthorized(request: Request, env: Env): boolean {
+  const expected = env.INTERNAL_API_SECRET?.trim();
+  if (!expected) return false;
+  const auth = request.headers.get("authorization");
+  const token = auth?.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  return token === expected;
+}
+
+async function safeInsertEvent(
+  db: D1Database,
+  emailId: string,
+  stage:
+    | "received"
+    | "queued"
+    | "processing"
+    | "ai_done"
+    | "action_done"
+    | "manual_review"
+    | "error"
+    | "retry",
+  status: "ok" | "retry" | "failed",
+  detail?: unknown
+): Promise<void> {
+  try {
+    await insertProcessingEvent(db, emailId, stage, status, detail);
+  } catch (err) {
+    console.error("insertProcessingEvent failed", err);
+  }
+}
+
+function json(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
 }

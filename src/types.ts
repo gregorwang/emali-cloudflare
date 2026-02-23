@@ -11,6 +11,7 @@ export interface Env {
   SLACK_WEBHOOK_URL?: string;
   CUSTOM_WEBHOOK_URL?: string;
   DASHBOARD_API_SECRET?: string;
+  INTERNAL_API_SECRET?: string;
   MAX_TEXT_BODY_LENGTH?: string;
   MAX_QUEUE_MESSAGE_BYTES?: string;
   RETENTION_DAYS_EMAILS?: string;
@@ -78,6 +79,13 @@ export interface AIClassifyResult {
   classification: AIClassification;
   provider: string;
   model: string;
+  rawTrace?: AIRawTrace;
+}
+
+export interface AIRawTrace {
+  requestJsonRedacted?: string;
+  responseText?: string;
+  responseJson?: string;
 }
 
 export interface ActionRuleConfig {

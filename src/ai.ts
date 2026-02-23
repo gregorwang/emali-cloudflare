@@ -52,18 +52,30 @@ interface ChatCompletionResponse {
   }>;
 }
 
+interface ChatResult {
+  content: string;
+  requestJsonRedacted: string;
+  responseText: string;
+  responseJson: string;
+}
+
 export class AIGatewayOpenAIService {
   constructor(private readonly env: Env) {}
 
   async classify(message: QueueMessage): Promise<AIClassifyResult> {
     const model = this.env.DEFAULT_AI_MODEL ?? "openai/gpt-5-mini";
     const prompt = buildClassificationPrompt(message);
-    const content = await this.chat(model, prompt, 0.1, 1024);
-    const parsed = parseJsonFromText(content);
+    const chatResult = await this.chat(model, prompt, 0.1, 1024);
+    const parsed = parseJsonFromText(chatResult.content);
     return {
       classification: classificationSchema.parse(parsed) as AIClassification,
       provider: "ai-gateway-openai-compat",
-      model
+      model,
+      rawTrace: {
+        requestJsonRedacted: chatResult.requestJsonRedacted,
+        responseText: chatResult.responseText,
+        responseJson: chatResult.responseJson
+      }
     };
   }
 
@@ -72,7 +84,7 @@ export class AIGatewayOpenAIService {
     userPrompt: string,
     temperature: number,
     maxTokens: number
-  ): Promise<string> {
+  ): Promise<ChatResult> {
     const url = `https://gateway.ai.cloudflare.com/v1/${this.env.CF_ACCOUNT_ID}/${this.env.AI_GATEWAY_ID}/compat/chat/completions`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json"
@@ -85,37 +97,53 @@ export class AIGatewayOpenAIService {
       headers["cf-aig-authorization"] = `Bearer ${this.env.CF_AIG_TOKEN}`;
     }
 
+    const requestPayload = {
+      model,
+      temperature,
+      max_tokens: maxTokens,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a strict email classification assistant. Output pure JSON only and do not wrap with markdown."
+        },
+        {
+          role: "user",
+          content: userPrompt
+        }
+      ]
+    };
+
     const response = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({
-        model,
-        temperature,
-        max_tokens: maxTokens,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a strict email classification assistant. Output pure JSON only and do not wrap with markdown."
-          },
-          {
-            role: "user",
-            content: userPrompt
-          }
-        ]
-      }),
+      body: JSON.stringify(requestPayload),
       signal: AbortSignal.timeout(30000)
     });
 
+    const rawBodyText = await response.text();
     if (!response.ok) {
-      throw new Error(`AI gateway request failed: HTTP ${response.status} ${await response.text()}`);
+      throw new Error(`AI gateway request failed: HTTP ${response.status} ${rawBodyText}`);
     }
 
-    const body = (await response.json()) as ChatCompletionResponse;
+    let body: ChatCompletionResponse;
+    try {
+      body = JSON.parse(rawBodyText) as ChatCompletionResponse;
+    } catch {
+      throw new Error("AI gateway returned non-JSON response");
+    }
     const content = body.choices?.[0]?.message?.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) return content.map((c) => c.text ?? "").join("\n");
-    return "{}";
+    return {
+      content:
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.map((c) => c.text ?? "").join("\n")
+            : "{}",
+      requestJsonRedacted: safeJsonStringify(redactObjectDeep(requestPayload)),
+      responseText: rawBodyText,
+      responseJson: safeJsonStringify(body)
+    };
   }
 }
 
@@ -180,24 +208,44 @@ async function classifyWithWorkersOrHeuristic(
     try {
       const fallbackModel = env.FALLBACK_AI_MODEL ?? "@cf/meta/llama-3.1-8b-instruct";
       const prompt = buildClassificationPrompt(message);
-      const res = (await env.AI.run(fallbackModel as keyof AiModels, {
+      const workersRequest = {
+        model: fallbackModel,
         prompt: `Return strict JSON only.\n${prompt}`,
+        max_tokens: 800
+      };
+      const res = (await env.AI.run(fallbackModel as keyof AiModels, {
+        prompt: workersRequest.prompt,
         max_tokens: 800
       })) as { response?: string };
       const parsed = parseJsonFromText(res.response ?? "{}");
       return {
         classification: classificationSchema.parse(parsed) as AIClassification,
         provider: "workers-ai",
-        model: fallbackModel
+        model: fallbackModel,
+        rawTrace: {
+          requestJsonRedacted: safeJsonStringify(redactObjectDeep(workersRequest)),
+          responseText: res.response ?? "",
+          responseJson: safeJsonStringify(res)
+        }
       };
     } catch (err) {
       console.error("Workers AI fallback failed:", err);
     }
   }
+  const heuristic = buildHeuristicClassification(message);
   return {
-    classification: buildHeuristicClassification(message),
+    classification: heuristic,
     provider: "heuristic",
-    model: "heuristic-v1"
+    model: "heuristic-v1",
+    rawTrace: {
+      requestJsonRedacted: safeJsonStringify({
+        reason: "OPENAI_API_KEY and CF_AIG_TOKEN are missing, and Workers AI unavailable",
+        subject: redactPII(message.subject),
+        from: redactPII(message.from)
+      }),
+      responseText: safeJsonStringify(heuristic),
+      responseJson: safeJsonStringify(heuristic)
+    }
   };
 }
 
@@ -224,4 +272,30 @@ function parseJsonFromText(raw: string): unknown {
       ? candidate.slice(firstBrace, lastBrace + 1)
       : candidate;
   return JSON.parse(jsonText);
+}
+
+function redactObjectDeep(value: unknown): unknown {
+  if (typeof value === "string") return redactPII(value);
+  if (Array.isArray(value)) return value.map((item) => redactObjectDeep(item));
+  if (!value || typeof value !== "object") return value;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = redactObjectDeep(inner);
+  }
+  return out;
+}
+
+function redactPII(input: string): string {
+  return input
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
+    .replace(/\+?\d[\d\s().-]{7,}\d/g, "[redacted-phone]");
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
 }

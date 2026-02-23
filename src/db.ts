@@ -1,4 +1,4 @@
-import type { AIClassification, QueueMessage } from "./types";
+import type { AIClassification, AIRawTrace, QueueMessage } from "./types";
 
 export async function insertEmailIfNotExists(db: D1Database, message: QueueMessage): Promise<boolean> {
   const result = await db
@@ -92,6 +92,62 @@ export async function upsertAIResult(
       provider,
       model,
       processingMs
+    )
+    .run();
+}
+
+export async function insertAIRawResponse(
+  db: D1Database,
+  emailId: string,
+  provider: string,
+  model: string,
+  rawTrace?: AIRawTrace
+): Promise<void> {
+  if (!rawTrace) return;
+  await db
+    .prepare(
+      `INSERT INTO ai_raw_responses (
+         id, email_id, provider, model, request_json_redacted, response_text, response_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      emailId,
+      provider,
+      model,
+      rawTrace.requestJsonRedacted ?? null,
+      rawTrace.responseText ?? null,
+      rawTrace.responseJson ?? null
+    )
+    .run();
+}
+
+export async function insertProcessingEvent(
+  db: D1Database,
+  emailId: string,
+  stage:
+    | "received"
+    | "queued"
+    | "processing"
+    | "ai_done"
+    | "action_done"
+    | "manual_review"
+    | "error"
+    | "retry",
+  status: "ok" | "retry" | "failed",
+  detail?: unknown
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO processing_events (id, email_id, stage, status, detail)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(
+      crypto.randomUUID(),
+      emailId,
+      stage,
+      status,
+      detail ? JSON.stringify(detail) : null
     )
     .run();
 }
@@ -322,6 +378,8 @@ export async function deleteEmailCascade(db: D1Database, emailIds: string[]): Pr
   await db.batch([
     db.prepare(`DELETE FROM manual_review_tasks WHERE email_id IN (${placeholders})`).bind(...emailIds),
     db.prepare(`DELETE FROM action_logs WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM processing_events WHERE email_id IN (${placeholders})`).bind(...emailIds),
+    db.prepare(`DELETE FROM ai_raw_responses WHERE email_id IN (${placeholders})`).bind(...emailIds),
     db.prepare(`DELETE FROM email_ai_results WHERE email_id IN (${placeholders})`).bind(...emailIds),
     db.prepare(`DELETE FROM attachments WHERE email_id IN (${placeholders})`).bind(...emailIds),
     db.prepare(`DELETE FROM emails WHERE id IN (${placeholders})`).bind(...emailIds)
@@ -513,4 +571,397 @@ export async function listPromptTemplates(
     )
     .all<{ id: string; name: string; version: string; is_active: number; created_at: string }>();
   return rows.results ?? [];
+}
+
+export async function getAIClassificationByEmailId(
+  db: D1Database,
+  emailId: string
+): Promise<AIClassification | null> {
+  const row = await db
+    .prepare(
+      `SELECT category, subcategory, sentiment, priority, language, summary, tags, requires_reply,
+              extracted_json, confidence_score
+       FROM email_ai_results
+       WHERE email_id = ?`
+    )
+    .bind(emailId)
+    .first<{
+      category: AIClassification["category"];
+      subcategory: string | null;
+      sentiment: AIClassification["sentiment"];
+      priority: number;
+      language: string | null;
+      summary: string | null;
+      tags: string | null;
+      requires_reply: number | null;
+      extracted_json: string | null;
+      confidence_score: number | null;
+    }>();
+  if (!row) return null;
+
+  let tags: string[] = [];
+  let extractedEntities: AIClassification["extractedEntities"] = {
+    amounts: [],
+    dates: [],
+    persons: [],
+    companies: [],
+    orderIds: [],
+    urls: []
+  };
+
+  try {
+    tags = row.tags ? (JSON.parse(row.tags) as string[]) : [];
+  } catch {
+    tags = [];
+  }
+
+  try {
+    extractedEntities = row.extracted_json
+      ? (JSON.parse(row.extracted_json) as AIClassification["extractedEntities"])
+      : extractedEntities;
+  } catch {
+    extractedEntities = {
+      amounts: [],
+      dates: [],
+      persons: [],
+      companies: [],
+      orderIds: [],
+      urls: []
+    };
+  }
+
+  return {
+    category: row.category,
+    subcategory: row.subcategory ?? undefined,
+    sentiment: row.sentiment,
+    priority: normalizePriority(row.priority),
+    language: row.language ?? "unknown",
+    summary: row.summary ?? "",
+    tags,
+    requiresReply: Boolean(row.requires_reply),
+    estimatedReplyDeadline: null,
+    extractedEntities,
+    suggestedActions: [],
+    confidenceScore: row.confidence_score ?? 0
+  };
+}
+
+export interface AdminEmailListFilters {
+  status?: string;
+  category?: string;
+  priority?: number;
+  fromDate?: string;
+  toDate?: string;
+  requiresManualReview?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listAdminEmails(
+  db: D1Database,
+  filters: AdminEmailListFilters
+): Promise<
+  Array<{
+    id: string;
+    received_at: string;
+    from_address: string;
+    to_address: string;
+    subject: string;
+    status: string;
+    category: string | null;
+    ai_priority: number | null;
+    confidence_score: number | null;
+    requires_manual_review: number;
+  }>
+> {
+  const where: string[] = [];
+  const binds: Array<string | number> = [];
+
+  if (filters.status) {
+    where.push("e.status = ?");
+    binds.push(filters.status);
+  }
+  if (filters.category) {
+    where.push("ai.category = ?");
+    binds.push(filters.category);
+  }
+  if (typeof filters.priority === "number") {
+    where.push("ai.priority = ?");
+    binds.push(filters.priority);
+  }
+  if (filters.fromDate) {
+    where.push("e.received_at >= ?");
+    binds.push(filters.fromDate);
+  }
+  if (filters.toDate) {
+    where.push("e.received_at <= ?");
+    binds.push(filters.toDate);
+  }
+  if (filters.requiresManualReview === true) {
+    where.push(
+      `EXISTS (
+         SELECT 1 FROM manual_review_tasks mrt
+         WHERE mrt.email_id = e.id
+           AND mrt.status IN ('pending', 'acknowledged', 'processing')
+       )`
+    );
+  }
+
+  const limit = Math.min(Math.max(filters.limit ?? 50, 1), 100);
+  const offset = Math.max(filters.offset ?? 0, 0);
+  binds.push(limit, offset);
+
+  const sql = `
+    SELECT
+      e.id,
+      e.received_at,
+      e.from_address,
+      e.to_address,
+      e.subject,
+      e.status,
+      ai.category,
+      ai.priority AS ai_priority,
+      ai.confidence_score,
+      CASE
+        WHEN EXISTS (
+          SELECT 1 FROM manual_review_tasks mrt
+          WHERE mrt.email_id = e.id
+            AND mrt.status IN ('pending', 'acknowledged', 'processing')
+        ) THEN 1
+        ELSE 0
+      END AS requires_manual_review
+    FROM emails e
+    LEFT JOIN email_ai_results ai ON ai.email_id = e.id
+    ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    ORDER BY e.received_at DESC
+    LIMIT ?
+    OFFSET ?`;
+
+  const rows = await db
+    .prepare(sql)
+    .bind(...binds)
+    .all<{
+      id: string;
+      received_at: string;
+      from_address: string;
+      to_address: string;
+      subject: string;
+      status: string;
+      category: string | null;
+      ai_priority: number | null;
+      confidence_score: number | null;
+      requires_manual_review: number;
+    }>();
+  return rows.results ?? [];
+}
+
+export async function getAdminEmailDetail(
+  db: D1Database,
+  emailId: string
+): Promise<{
+  email: {
+    id: string;
+    email_message_id: string | null;
+    thread_id: string | null;
+    received_at: string;
+    to_address: string;
+    from_address: string;
+    from_name: string | null;
+    subject: string;
+    text_body: string | null;
+    status: string;
+    last_error: string | null;
+    raw_r2_key: string | null;
+    parsed_r2_key: string | null;
+    has_attachments: number | null;
+  };
+  aiResult: {
+    category: string | null;
+    subcategory: string | null;
+    sentiment: string | null;
+    priority: number | null;
+    language: string | null;
+    summary: string | null;
+    tags: string | null;
+    requires_reply: number | null;
+    extracted_json: string | null;
+    confidence_score: number | null;
+    ai_provider: string | null;
+    ai_model: string | null;
+    processing_ms: number | null;
+    created_at: string | null;
+  } | null;
+  aiRaw: {
+    id: string;
+    provider: string | null;
+    model: string | null;
+    request_json_redacted: string | null;
+    response_text: string | null;
+    response_json: string | null;
+    created_at: string;
+  } | null;
+  attachments: Array<{ filename: string; mime_type: string | null; size_bytes: number | null; r2_key: string | null }>;
+  actionLogs: Array<{
+    id: string;
+    action_type: string;
+    action_config: string | null;
+    status: string | null;
+    error_msg: string | null;
+    executed_at: string;
+  }>;
+  manualReviews: Array<{
+    id: string;
+    priority_level: string;
+    reason: string;
+    status: string;
+    assignee: string | null;
+    created_at: string;
+  }>;
+} | null> {
+  const email = await db
+    .prepare(
+      `SELECT id, email_message_id, thread_id, received_at, to_address, from_address, from_name, subject,
+              text_body, status, last_error, raw_r2_key, parsed_r2_key, has_attachments
+       FROM emails
+       WHERE id = ?`
+    )
+    .bind(emailId)
+    .first<{
+      id: string;
+      email_message_id: string | null;
+      thread_id: string | null;
+      received_at: string;
+      to_address: string;
+      from_address: string;
+      from_name: string | null;
+      subject: string;
+      text_body: string | null;
+      status: string;
+      last_error: string | null;
+      raw_r2_key: string | null;
+      parsed_r2_key: string | null;
+      has_attachments: number | null;
+    }>();
+  if (!email) return null;
+
+  const [aiRows, aiRawRows, attachmentRows, actionRows, reviewRows] = await Promise.all([
+    db
+      .prepare(
+        `SELECT category, subcategory, sentiment, priority, language, summary, tags, requires_reply,
+                extracted_json, confidence_score, ai_provider, ai_model, processing_ms, created_at
+         FROM email_ai_results
+         WHERE email_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .bind(emailId)
+      .all<{
+        category: string | null;
+        subcategory: string | null;
+        sentiment: string | null;
+        priority: number | null;
+        language: string | null;
+        summary: string | null;
+        tags: string | null;
+        requires_reply: number | null;
+        extracted_json: string | null;
+        confidence_score: number | null;
+        ai_provider: string | null;
+        ai_model: string | null;
+        processing_ms: number | null;
+        created_at: string | null;
+      }>(),
+    db
+      .prepare(
+        `SELECT id, provider, model, request_json_redacted, response_text, response_json, created_at
+         FROM ai_raw_responses
+         WHERE email_id = ?
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .bind(emailId)
+      .all<{
+        id: string;
+        provider: string | null;
+        model: string | null;
+        request_json_redacted: string | null;
+        response_text: string | null;
+        response_json: string | null;
+        created_at: string;
+      }>(),
+    db
+      .prepare(
+        `SELECT filename, mime_type, size_bytes, r2_key
+         FROM attachments
+         WHERE email_id = ?
+         ORDER BY created_at DESC`
+      )
+      .bind(emailId)
+      .all<{ filename: string; mime_type: string | null; size_bytes: number | null; r2_key: string | null }>(),
+    db
+      .prepare(
+        `SELECT id, action_type, action_config, status, error_msg, executed_at
+         FROM action_logs
+         WHERE email_id = ?
+         ORDER BY executed_at DESC`
+      )
+      .bind(emailId)
+      .all<{
+        id: string;
+        action_type: string;
+        action_config: string | null;
+        status: string | null;
+        error_msg: string | null;
+        executed_at: string;
+      }>(),
+    db
+      .prepare(
+        `SELECT id, priority_level, reason, status, assignee, created_at
+         FROM manual_review_tasks
+         WHERE email_id = ?
+         ORDER BY created_at DESC`
+      )
+      .bind(emailId)
+      .all<{
+        id: string;
+        priority_level: string;
+        reason: string;
+        status: string;
+        assignee: string | null;
+        created_at: string;
+      }>()
+  ]);
+
+  return {
+    email,
+    aiResult: (aiRows.results ?? [])[0] ?? null,
+    aiRaw: (aiRawRows.results ?? [])[0] ?? null,
+    attachments: attachmentRows.results ?? [],
+    actionLogs: actionRows.results ?? [],
+    manualReviews: reviewRows.results ?? []
+  };
+}
+
+export async function listProcessingEventsByEmail(
+  db: D1Database,
+  emailId: string
+): Promise<Array<{ id: string; stage: string; status: string; detail: string | null; created_at: string }>> {
+  const rows = await db
+    .prepare(
+      `SELECT id, stage, status, detail, created_at
+       FROM processing_events
+       WHERE email_id = ?
+       ORDER BY created_at ASC`
+    )
+    .bind(emailId)
+    .all<{ id: string; stage: string; status: string; detail: string | null; created_at: string }>();
+  return rows.results ?? [];
+}
+
+function normalizePriority(priority: number): 1 | 2 | 3 | 4 | 5 {
+  if (priority <= 1) return 1;
+  if (priority === 2) return 2;
+  if (priority === 3) return 3;
+  if (priority === 4) return 4;
+  return 5;
 }
